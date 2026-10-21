@@ -880,7 +880,7 @@ $('#backupInput').addEventListener('change', async (e) => {
   if (!f) return;
   try {
     toast('Restaurando backup…', 60000);
-    const r = await importBackup(f);
+    const r = await importBackup(f, (n) => toast(`Restaurando backup… ${n} páginas`, 60000));
     toast(`Backup restaurado: ${r.songs} músicas, ${r.setlists} repertórios`, 4000);
   } catch (err) {
     toast(err.message, 5000);
