@@ -68,6 +68,42 @@ try {
   ok(!sl.items.includes(mt.id) && (await db.getPages(mt.id)).length === 0, 'excluir música limpa páginas e repertórios');
 
   await db.clearAll();
+
+  // ---- montar pela lista ----
+  const { matchList, collapse, splitTitle, cleanLine } = await import('../js/matcher.js');
+  const lib = [
+    { id: 'a', band: 'Banda Alfa', title: 'Luz da Manhã', pageCount: 2 },
+    { id: 'b', band: 'Banda Beta', title: 'Estrada Velha', pageCount: 1 },
+    { id: 'c', band: 'Banda Alfa', title: 'Estrada Velha', pageCount: 1 },
+    { id: 'd', band: 'Grupo Gama', title: 'Exagerando Tudo', pageCount: 1 },
+    { id: 'e', band: 'Grupo Gama', title: 'Número 2', pageCount: 1 },
+    { id: 'f', band: 'Banda Beta', title: 'Noite Inteira de Sábado', pageCount: 3 },
+  ];
+  ok(cleanLine('*1.* Luz da Manhã 🎸 (tom G)') === 'Luz da Manhã', `limpa negrito, número, emoji e tom: "${cleanLine('*1.* Luz da Manhã 🎸 (tom G)')}"`);
+
+  const msg = [
+    '*Show Sábado* 🎤',
+    '1. luz da manha 1',
+    '2. Luz da Manhã 2',
+    '3) Banda Beta - Estrada Velha',
+    '4 - estrada velha',
+    '5. Exagerado tudo',
+    '6. Número 2',
+    '7. noite inteira',
+    '8. Música Que Não Existe',
+  ].join('\n');
+  const { name, body } = splitTitle(msg, lib);
+  ok(name === 'Show Sábado', `primeira linha vira nome: "${name}"`);
+  const ents = collapse(matchList(body, lib));
+  const sum = ents.map((e) => `${e.status}:${e.songId}`).join(' ');
+  ok(ents[0].status === 'ok' && ents[0].songId === 'a' && ents[1].songId === 'b', `páginas 1 e 2 viram uma entrada só, sem acento: ${sum}`);
+  ok(ents[1].status === 'ok', 'banda citada desfaz a dúvida (Banda Beta - Estrada Velha)');
+  ok(ents[2].status === 'choose' && ents[2].candidates.length === 2, 'mesmo título em duas bandas pede escolha');
+  ok(ents[3].status === 'guess' && ents[3].songId === 'd', `erro de digitação sugere a mais parecida: ${ents[3].status}:${ents[3].songId}`);
+  ok(ents[4].status === 'ok' && ents[4].songId === 'e', 'título que termina em número não é confundido com página');
+  ok(ents[5].status === 'guess' && ents[5].songId === 'f', `nome incompleto sugere a música certa: ${ents[5].status}:${ents[5].songId}`);
+  ok(ents[6].status === 'none', `música inexistente fica como não encontrada: ${ents[6].status}:${ents[6].songId}`);
+  ok(ents.length === 7, `7 entradas no total: ${ents.length}`);
 } catch (e) {
   out.push('ERRO ' + e.stack);
 }

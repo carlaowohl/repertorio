@@ -1,6 +1,7 @@
 import * as db from './db.js';
 import { importFiles, NO_BAND } from './importer.js';
 import { exportBackup, importBackup } from './backup.js';
+import { matchList, collapse, splitTitle } from './matcher.js';
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const view = $('#view');
@@ -78,6 +79,7 @@ async function confirmBox(msg, okLabel = 'Confirmar', danger = false) {
 
 const routes = [
   [/^#\/repertorios$/, () => renderSetlists()],
+  [/^#\/colar$/, () => renderPaste()],
   [/^#\/repertorio\/([\w]+)$/, (id) => renderSetlist(id)],
   [/^#\/show\/([\w]+)(?:\/(\d+))?$/, (id, i) => startShow({ setlistId: id, start: +(i || 0) })],
   [/^#\/ver\/([\w]+)$/, (id) => startShow({ songId: id })],
@@ -87,7 +89,7 @@ const routes = [
 function route() {
   const hash = location.hash || '#/musicas';
   if (!hash.startsWith('#/show') && !hash.startsWith('#/ver')) stopShow();
-  const tab = hash.startsWith('#/repertorio') ? 'repertorios' : 'musicas';
+  const tab = hash.startsWith('#/repertorio') || hash === '#/colar' ? 'repertorios' : 'musicas';
   document.querySelectorAll('.tabs a').forEach((a) => a.classList.toggle('on', a.dataset.tab === tab));
   for (const [re, fn] of routes) {
     const m = hash.match(re);
@@ -250,7 +252,8 @@ async function renderSetlists() {
   view.innerHTML = `
     <div class="toolbar">
       <h2 class="grow">Repertórios</h2>
-      <button class="btn primary" id="newSl">+ Novo repertório</button>
+      <a class="btn primary" href="#/colar">📋 Montar pela lista</a>
+      <button class="btn" id="newSl">+ Novo vazio</button>
     </div>
     ${setlists.length ? `<div class="cards">${setlists.map((sl) => `
       <a class="card" href="#/repertorio/${sl.id}">
@@ -387,6 +390,158 @@ function bindPicker(allSongs, already, order) {
     draw();
   });
   draw();
+}
+
+// ---------- montar repertório a partir de texto colado ----------
+
+const paste = {
+  text: prefs.get('pasteDraft', ''),
+  name: '',
+  entries: null,
+};
+
+const STATUS = {
+  ok: ['✅', ''],
+  choose: ['⚠️', 'Mesmo nome em mais de uma banda — confira'],
+  guess: ['⚠️', 'Sugestão mais parecida — confira'],
+  none: ['❌', 'Não encontrada na biblioteca'],
+};
+
+async function renderPaste() {
+  const songs = await db.getAll('songs');
+  const byId = new Map(songs.map((s) => [s.id, s]));
+
+  if (!paste.entries) {
+    view.innerHTML = `
+      <div class="toolbar">
+        <a class="btn ghost" href="#/repertorios">‹</a>
+        <h2 class="grow">Montar pela lista</h2>
+      </div>
+      <div class="paste">
+        <p class="muted">Cole a sequência do grupo, uma música por linha. Pode vir numerada, com banda, com negrito ou emoji. Se a primeira linha for o nome do show, ela vira o nome do repertório.</p>
+        <textarea id="ptext" rows="12" placeholder="Show Sábado&#10;1. Nome da música&#10;2. Banda - Outra música&#10;3. Música com duas páginas 1&#10;4. Música com duas páginas 2">${esc(paste.text)}</textarea>
+        <div class="row wrap flush">
+          <button class="btn" id="pclip">Colar da área de transferência</button>
+          <span class="grow"></span>
+          <button class="btn primary big" id="prun">Montar sequência</button>
+        </div>
+      </div>`;
+    const ta = $('#ptext');
+    ta.addEventListener('input', () => { paste.text = ta.value; prefs.set('pasteDraft', ta.value); });
+    $('#pclip').onclick = async () => {
+      try {
+        ta.value = await navigator.clipboard.readText();
+        ta.dispatchEvent(new Event('input'));
+      } catch {
+        toast('Sem acesso à área de transferência. Segure no campo e toque em Colar.');
+        ta.focus();
+      }
+    };
+    $('#prun').onclick = () => {
+      if (!songs.length) { toast('Importe as músicas antes de montar o repertório.'); return; }
+      if (!paste.text.trim()) { toast('Cole a lista primeiro.'); return; }
+      const { name, body } = splitTitle(paste.text, songs);
+      paste.name = name || `Repertório ${new Date().toLocaleDateString('pt-BR')}`;
+      paste.entries = collapse(matchList(body, songs));
+      renderPaste();
+    };
+    return;
+  }
+
+  const entries = paste.entries;
+  const count = (st) => entries.filter((e) => e.status === st).length;
+  const included = entries.filter((e) => e.songId);
+  const check = count('choose') + count('guess');
+
+  view.innerHTML = `
+    <div class="toolbar">
+      <button class="btn ghost" id="pback">‹</button>
+      <h2 class="grow">Conferir sequência</h2>
+    </div>
+    <div class="paste">
+      <label class="muted">Nome do repertório<input id="pname" value="${esc(paste.name)}"></label>
+      <p class="summary">
+        <span>✅ ${count('ok')} encontrada${count('ok') === 1 ? '' : 's'}</span>
+        ${check ? `<span>⚠️ ${check} para conferir</span>` : ''}
+        ${count('none') ? `<span>❌ ${count('none')} não encontrada${count('none') === 1 ? '' : 's'}</span>` : ''}
+      </p>
+      <ol class="match" id="mlist">
+        ${entries.map((e, i) => {
+          const [icon, hint] = STATUS[e.status];
+          const chosen = e.songId && byId.get(e.songId);
+          const opts = e.candidates.filter((c) => byId.has(c.song.id));
+          if (chosen && !opts.some((c) => c.song.id === chosen.id)) opts.unshift({ song: chosen });
+          return `
+          <li class="m-${e.status}" data-i="${i}">
+            <span class="m-icon">${icon}</span>
+            <div class="m-body">
+              <div class="m-line">${esc(e.line)}${hint ? ` <span class="m-hint">· ${hint}</span>` : ''}</div>
+              <select data-pick>
+                ${opts.map((c) => `<option value="${c.song.id}" ${c.song.id === e.songId ? 'selected' : ''}>${esc(c.song.title)} — ${esc(c.song.band)}${c.song.pageCount > 1 ? ` (${c.song.pageCount} págs)` : ''}</option>`).join('')}
+                <option value="" ${e.songId ? '' : 'selected'}>— pular esta linha —</option>
+                <option value="__search">🔎 Buscar outra música…</option>
+              </select>
+            </div>
+          </li>`;
+        }).join('')}
+      </ol>
+      <div class="row wrap flush sticky-bottom">
+        <button class="btn" id="pedit">Editar texto</button>
+        <span class="grow"></span>
+        <button class="btn primary big" id="pcreate" ${included.length ? '' : 'disabled'}>Criar repertório (${included.length})</button>
+      </div>
+    </div>`;
+
+  $('#pname').addEventListener('input', (e) => { paste.name = e.target.value; });
+  $('#pback').onclick = $('#pedit').onclick = () => { paste.entries = null; renderPaste(); };
+  $('#mlist').addEventListener('change', async (e) => {
+    const sel = e.target.closest('[data-pick]');
+    if (!sel) return;
+    const entry = entries[+sel.closest('li').dataset.i];
+    let id = sel.value;
+    if (id === '__search') {
+      id = await searchOneDialog(songs, entry.query);
+      if (id === null) { renderPaste(); return; }
+      if (!entry.candidates.some((c) => c.song.id === id)) entry.candidates.unshift({ song: byId.get(id), score: 0 });
+    }
+    entry.songId = id || null;
+    entry.status = id ? 'ok' : 'none';
+    renderPaste();
+  });
+  $('#pcreate').onclick = async () => {
+    const items = collapse(entries).filter((e) => e.songId).map((e) => e.songId);
+    const sl = await createSetlist(paste.name.trim() || 'Repertório');
+    sl.items = items;
+    await db.put('setlists', sl);
+    paste.entries = null;
+    paste.text = '';
+    prefs.set('pasteDraft', '');
+    toast(`Repertório criado com ${items.length} música${items.length === 1 ? '' : 's'}`);
+    location.hash = `#/repertorio/${sl.id}`;
+  };
+}
+
+async function searchOneDialog(songs, initial = '') {
+  const sorted = [...songs].sort((a, b) => byBand(a.band, b.band) || byTitle(a, b));
+  const done = openDialog(
+    `<h2>Escolher música</h2>
+     <input type="search" id="sq" value="${esc(initial)}" placeholder="Buscar…" autocomplete="off" autofocus>
+     <div class="pick tall" id="slist"></div>
+     <div class="dlg-actions"><button class="btn" value="cancel">Cancelar</button></div>`
+  );
+  const input = $('#sq', dlg);
+  const draw = () => {
+    const words = norm(input.value.trim()).split(/\s+/).filter(Boolean);
+    const hits = sorted.filter((s) => {
+      const hay = norm(`${s.band} ${s.title}`);
+      return words.every((w) => hay.includes(w));
+    });
+    $('#slist', dlg).innerHTML = (hits.length ? hits : sorted).map((s) =>
+      `<button class="pick-item" value="${s.id}"><span>${esc(s.title)}</span><span class="muted">${esc(s.band)}</span></button>`).join('');
+  };
+  input.addEventListener('input', draw);
+  draw();
+  return done;
 }
 
 // ---------- modo show ----------
