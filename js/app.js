@@ -2,6 +2,7 @@ import * as db from './db.js';
 import { importFiles, NO_BAND } from './importer.js';
 import { exportBackup, importBackup } from './backup.js';
 import { matchList, collapse, splitTitle } from './matcher.js';
+import { suggestArtists } from './artists.js';
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const view = $('#view');
@@ -80,6 +81,7 @@ async function confirmBox(msg, okLabel = 'Confirmar', danger = false) {
 const routes = [
   [/^#\/repertorios$/, () => renderSetlists()],
   [/^#\/colar$/, () => renderPaste()],
+  [/^#\/artistas$/, () => renderArtists()],
   [/^#\/repertorio\/([\w]+)$/, (id) => renderSetlist(id)],
   [/^#\/show\/([\w]+)(?:\/(\d+))?$/, (id, i) => startShow({ setlistId: id, start: +(i || 0) })],
   [/^#\/ver\/([\w]+)$/, (id) => startShow({ songId: id })],
@@ -122,7 +124,12 @@ async function renderLibrary() {
   }
 
   const bands = [...new Set(songs.map((s) => s.band))].sort(byBand);
+  const noBand = songs.filter((s) => s.band === NO_BAND).length;
   view.innerHTML = `
+    ${noBand ? `<a class="banner" href="#/artistas">
+      <span><b>${noBand} música${noBand === 1 ? '' : 's'} sem banda.</b> O app pode sugerir o artista de cada uma.</span>
+      <span class="btn small primary">Completar artistas</span>
+    </a>` : ''}
     <div class="toolbar">
       <input type="search" id="q" placeholder="Buscar música ou banda…" value="${esc(libState.q)}" autocomplete="off">
       <span class="muted count"></span>
@@ -542,6 +549,144 @@ async function searchOneDialog(songs, initial = '') {
   input.addEventListener('input', draw);
   draw();
   return done;
+}
+
+// ---------- completar artistas ----------
+
+const artistState = { rows: new Map(), running: false, stop: false };
+
+async function renderArtists() {
+  const songs = await db.getAll('songs');
+  const pending = songs.filter((s) => s.band === NO_BAND).sort(byTitle);
+  const bands = [...new Set(songs.map((s) => s.band))].filter((b) => b !== NO_BAND).sort(byBand);
+  const rows = artistState.rows;
+  pending.forEach((s) => rows.has(s.id) || rows.set(s.id, { value: '', auto: false, suggestions: null, status: '' }));
+
+  if (!pending.length) {
+    view.innerHTML = `
+      <div class="toolbar"><a class="btn ghost" href="#/musicas">‹</a><h2 class="grow">Completar artistas</h2></div>
+      <div class="empty"><p>Todas as músicas já têm banda. 🎉</p><a class="btn" href="#/musicas">Voltar para Músicas</a></div>`;
+    return;
+  }
+
+  const filled = () => pending.filter((s) => rows.get(s.id).value.trim()).length;
+  const unsearched = () => pending.filter((s) => !rows.get(s.id).suggestions).length;
+
+  view.innerHTML = `
+    <div class="toolbar">
+      <a class="btn ghost" href="#/musicas">‹</a>
+      <h2 class="grow">Completar artistas</h2>
+      <button class="btn primary" id="aSearch"></button>
+    </div>
+    <div class="paste">
+      <p class="muted">${pending.length} música${pending.length === 1 ? '' : 's'} sem banda. As sugestões vêm da internet (base pública MusicBrainz) e consideram primeiro as bandas que você já tem. <b>Confira antes de salvar</b> — a mesma música pode ter várias versões.</p>
+      <datalist id="bandlist">${bands.map((b) => `<option value="${esc(b)}">`).join('')}</datalist>
+      <ol class="match artists" id="alist">
+        ${pending.map((s) => `
+          <li data-id="${s.id}">
+            <div class="m-body">
+              <div class="a-title">${esc(s.title)}${s.pageCount > 1 ? ` <span class="badge">${s.pageCount} págs</span>` : ''}</div>
+              <input list="bandlist" placeholder="Banda ou artista" data-band>
+              <div class="a-sugs"></div>
+            </div>
+          </li>`).join('')}
+      </ol>
+      <div class="row wrap flush sticky-bottom">
+        <span class="muted" id="aInfo"></span>
+        <span class="grow"></span>
+        <button class="btn primary big" id="aSave"></button>
+      </div>
+    </div>`;
+
+  const drawRow = (id) => {
+    const li = view.querySelector(`li[data-id="${id}"]`);
+    if (!li) return;
+    const r = rows.get(id);
+    const input = $('[data-band]', li);
+    if (document.activeElement !== input) input.value = r.value;
+    li.classList.toggle('m-guess', r.auto && !!r.value);
+    const sugs = $('.a-sugs', li);
+    if (r.status) sugs.innerHTML = `<span class="muted">${esc(r.status)}</span>`;
+    else if (r.suggestions?.length) {
+      sugs.innerHTML = r.suggestions.map((g) =>
+        `<button type="button" class="chip ${g.name === r.value ? 'on' : ''}" data-sug="${esc(g.name)}">${esc(g.name)}${g.known ? ' ★' : ''}</button>`).join('');
+    } else if (r.suggestions) sugs.innerHTML = '<span class="muted">Sem sugestão — digite o nome</span>';
+    else sugs.innerHTML = '';
+  };
+  const drawFooter = () => {
+    const n = filled();
+    $('#aSave').textContent = `Salvar ${n} preenchida${n === 1 ? '' : 's'}`;
+    $('#aSave').disabled = !n;
+    const u = unsearched();
+    $('#aSearch').textContent = artistState.running ? '■ Parar busca' : u ? `🔎 Buscar sugestões (${u})` : '🔎 Buscar de novo';
+    $('#aInfo').textContent = artistState.running ? 'Buscando… (1 por segundo)' : '';
+  };
+  pending.forEach((s) => drawRow(s.id));
+  drawFooter();
+
+  $('#alist').addEventListener('input', (e) => {
+    const li = e.target.closest('li');
+    const r = rows.get(li.dataset.id);
+    r.value = e.target.value;
+    r.auto = false;
+    drawRow(li.dataset.id);
+    drawFooter();
+  });
+  $('#alist').addEventListener('click', (e) => {
+    const chip = e.target.closest('[data-sug]');
+    if (!chip) return;
+    const id = chip.closest('li').dataset.id;
+    Object.assign(rows.get(id), { value: chip.dataset.sug, auto: false });
+    drawRow(id);
+    drawFooter();
+  });
+
+  $('#aSearch').onclick = async () => {
+    if (artistState.running) { artistState.stop = true; return; }
+    if (!navigator.onLine) { toast('Sem internet. Dá para preencher digitando, ou buscar quando conectar.'); return; }
+    const todo = unsearched() ? pending.filter((s) => !rows.get(s.id).suggestions) : pending;
+    artistState.running = true;
+    artistState.stop = false;
+    drawFooter();
+    for (const s of todo) {
+      if (artistState.stop || location.hash !== '#/artistas') break;
+      const r = rows.get(s.id);
+      r.status = 'buscando…';
+      drawRow(s.id);
+      try {
+        r.suggestions = await suggestArtists(s.title, bands);
+        r.status = '';
+        if (!r.value && r.suggestions[0]) Object.assign(r, { value: r.suggestions[0].name, auto: true });
+      } catch {
+        r.status = 'Falhou a busca — tente de novo';
+      }
+      drawRow(s.id);
+      drawFooter();
+    }
+    artistState.running = false;
+    if (location.hash === '#/artistas') drawFooter();
+  };
+
+  $('#aSave').onclick = async () => {
+    let saved = 0;
+    const clashes = [];
+    for (const s of pending) {
+      const r = rows.get(s.id);
+      const band = r.value.trim();
+      if (!band || band === NO_BAND) continue;
+      const key = db.songKey(band, s.title);
+      const clash = await db.findSongByKey(key);
+      if (clash && clash.id !== s.id) { clashes.push(s.title); continue; }
+      Object.assign(s, { band, key, updatedAt: Date.now() });
+      await db.put('songs', s);
+      rows.delete(s.id);
+      saved++;
+    }
+    toast(clashes.length
+      ? `${saved} salvas. Já existe com essa banda: ${clashes.join(', ')}`
+      : `${saved} música${saved === 1 ? '' : 's'} atualizada${saved === 1 ? '' : 's'}`, 4000);
+    renderArtists();
+  };
 }
 
 // ---------- modo show ----------

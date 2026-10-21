@@ -67,6 +67,12 @@ try {
   const sl = await db.get('setlists', 'sl1');
   ok(!sl.items.includes(mt.id) && (await db.getPages(mt.id)).length === 0, 'excluir música limpa páginas e repertórios');
 
+  // página sem banda de música que já tem banda vai para ela
+  await importFiles([await fakeImage('Banda Z - Canção Longa 1.png', 'P1')]);
+  await importFiles([await fakeImage('Canção Longa 2.png', 'P2')]);
+  const cl = (await db.getAll('songs')).filter((s) => s.title === 'Canção Longa');
+  ok(cl.length === 1 && cl[0].band === 'Banda Z' && cl[0].pageCount === 2, `página sem banda entra na música existente: ${JSON.stringify(cl.map((s) => [s.band, s.pageCount]))}`);
+
   await db.clearAll();
 
   // ---- montar pela lista ----

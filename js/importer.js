@@ -62,8 +62,18 @@ export async function importFiles(fileList, onProgress = () => {}) {
   const touched = new Map(); // songId -> song
   let done = 0;
 
+  // Arquivo sem banda cuja música já existe com banda (ex: completada antes) vai para ela.
+  const existing = await db.getAll('songs');
+  const bandFor = (title) => {
+    const t = db.songKey('', title);
+    const hits = existing.filter((s) => s.band !== NO_BAND && db.songKey('', s.title) === t);
+    return hits.length === 1 ? hits[0].band : NO_BAND;
+  };
+
   for (const file of files) {
-    const { band, title, page } = parseFileName(file);
+    const parsed = parseFileName(file);
+    const { title, page } = parsed;
+    const band = parsed.band === NO_BAND ? bandFor(title) : parsed.band;
     const key = db.songKey(band, title);
     let song = touched.get(key) || (await db.findSongByKey(key));
     if (!song) {

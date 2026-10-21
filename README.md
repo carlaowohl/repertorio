@@ -14,6 +14,12 @@ Banda - Nome da Música 2.jpg
 - Sem número = página 1. Sem banda = "Sem banda" (ou o nome da pasta, se importar uma pasta).
 - Reimportar o mesmo nome substitui a página, sem duplicar.
 
+## Completar artistas
+
+Quando houver músicas "Sem banda", aparece um aviso em Músicas > **Completar artistas**. O botão de busca consulta o MusicBrainz (base pública, precisa de internet, 1 música por segundo) e preenche o artista mais provável, com outras 2 opções para trocar. ★ = banda que já está na biblioteca. Nada é salvo sem tocar em **Salvar**.
+
+Depois disso, importar `Nome da Música 2.jpg` sem banda adiciona a página à música que já tem banda.
+
 ## Montar pela lista
 
 Repertórios > **📋 Montar pela lista**: cole a sequência que saiu no grupo, uma música por linha.
