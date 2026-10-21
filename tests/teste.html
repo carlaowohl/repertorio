@@ -1,0 +1,76 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Testes</title>
+<pre id="out">rodando…</pre>
+<script type="module">
+import * as db from '../js/db.js';
+import { parseFileName, importFiles } from '../js/importer.js';
+
+const out = [];
+const show = () => { document.getElementById('out').textContent = out.join('\n'); };
+const ok = (cond, msg) => { out.push(`${cond ? 'OK  ' : 'FALHA'} ${msg}`); show(); };
+const step = (msg) => { out.push(`...  ${msg}`); show(); };
+
+function fakeImage(name, label, folder) {
+  const c = document.createElement('canvas');
+  c.width = 3000; c.height = 4000;
+  const g = c.getContext('2d');
+  g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.height);
+  g.fillStyle = '#000'; g.font = '200px sans-serif'; g.fillText(label, 100, 400);
+  return new Promise((res) => c.toBlob((b) => {
+    const f = new File([b], name, { type: 'image/png' });
+    if (folder) Object.defineProperty(f, 'webkitRelativePath', { value: `${folder}/${name}` });
+    res(f);
+  }, 'image/png'));
+}
+
+try {
+  const p = (n, folder) => parseFileName({ name: n, webkitRelativePath: folder ? `${folder}/${n}` : '' });
+  let r = p('Banda X - Musica Teste 2.jpg');
+  ok(r.band === 'Banda X' && r.title === 'Musica Teste' && r.page === 2, `parse com banda e página: ${JSON.stringify(r)}`);
+  r = p('Musica Solta.png');
+  ok(r.band === 'Sem banda' && r.title === 'Musica Solta' && r.page === 1, `parse sem banda: ${JSON.stringify(r)}`);
+  r = p('Musica 1999.jpg');
+  ok(r.title === 'Musica 1999' && r.page === 1, `ano no título não vira página: ${JSON.stringify(r)}`);
+  r = p('Outra Musica 1.jpg', 'Banda Pasta');
+  ok(r.band === 'Banda Pasta' && r.page === 1, `banda pela pasta: ${JSON.stringify(r)}`);
+  r = p('Banda Y - Titulo - Ao Vivo 3.jpg');
+  ok(r.band === 'Banda Y' && r.title === 'Titulo - Ao Vivo' && r.page === 3, `hífen extra no título: ${JSON.stringify(r)}`);
+
+  step('limpando banco');
+  await db.clearAll();
+  step('gerando imagens');
+  const files = await Promise.all([
+    fakeImage('Banda X - Musica Teste 2.png', 'Pagina 2'),
+    fakeImage('Banda X - Musica Teste 1.png', 'Pagina 1'),
+    fakeImage('Banda X - Outra 1.png', 'Outra'),
+    fakeImage('Avulsa.png', 'Avulsa'),
+  ]);
+  step('importando');
+  const res = await importFiles([...files, new File(['x'], 'notas.txt', { type: 'text/plain' })]);
+  ok(res.songs === 3 && res.files === 4 && res.skipped === 1, `importação: ${JSON.stringify(res)}`);
+
+  const songs = await db.getAll('songs');
+  const mt = songs.find((s) => s.title === 'Musica Teste');
+  ok(mt && mt.pageCount === 2, 'Musica Teste com 2 páginas');
+  const pages = await db.getPages(mt.id);
+  ok(pages.map((x) => x.n).join() === '1,2', 'páginas em ordem 1,2 mesmo importando fora de ordem');
+  const bmp = await createImageBitmap(pages[0].blob);
+  ok(Math.max(bmp.width, bmp.height) <= 2400 && pages[0].blob.type === 'image/jpeg', `imagem reduzida para ${bmp.width}x${bmp.height} jpeg`);
+
+  // reimportar a mesma página substitui, não duplica
+  await importFiles([await fakeImage('Banda X - Musica Teste 1.png', 'Nova')]);
+  ok((await db.getAll('songs')).length === 3 && (await db.getPages(mt.id)).length === 2, 'reimportar substitui sem duplicar');
+
+  await db.put('setlists', { id: 'sl1', name: 'Show', items: [mt.id, songs[0].id], createdAt: 1, updatedAt: 1 });
+  await db.deleteSong(mt.id);
+  const sl = await db.get('setlists', 'sl1');
+  ok(!sl.items.includes(mt.id) && (await db.getPages(mt.id)).length === 0, 'excluir música limpa páginas e repertórios');
+
+  await db.clearAll();
+} catch (e) {
+  out.push('ERRO ' + e.stack);
+}
+const text = out.join('\n');
+document.getElementById('out').textContent = text + (text.includes('FALHA') || text.includes('ERRO') ? '\n\nRESULTADO: FALHOU' : '\n\nRESULTADO: TUDO OK');
+</script>

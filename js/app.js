@@ -1,0 +1,632 @@
+import * as db from './db.js';
+import { importFiles, NO_BAND } from './importer.js';
+import { exportBackup, importBackup } from './backup.js';
+
+const $ = (sel, root = document) => root.querySelector(sel);
+const view = $('#view');
+const dlg = $('#dlg');
+
+const esc = (s) =>
+  String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+const norm = (s) => s.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
+
+const collator = new Intl.Collator('pt-BR', { sensitivity: 'base', numeric: true });
+const byTitle = (a, b) => collator.compare(a.title, b.title);
+const byBand = (a, b) =>
+  (a === NO_BAND) - (b === NO_BAND) || collator.compare(a, b);
+
+const prefs = {
+  get(k, d) { try { return localStorage.getItem(k) ?? d; } catch { return d; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+};
+
+function toast(msg, ms = 2600) {
+  const t = $('#toast');
+  t.textContent = msg;
+  t.classList.add('on');
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => t.classList.remove('on'), ms);
+}
+
+// ---------- diálogos ----------
+
+function openDialog(html, onSubmit) {
+  dlg.innerHTML = `<form method="dialog">${html}</form>`;
+  const form = $('form', dlg);
+  const done = new Promise((resolve) => {
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const action = e.submitter?.value || 'ok';
+      if (action !== 'cancel' && onSubmit && (await onSubmit(action, form)) === false) return;
+      resolve(action === 'cancel' ? null : action);
+      dlg.close();
+    });
+    dlg.addEventListener('close', () => resolve(null), { once: true });
+  });
+  dlg.showModal();
+  $('[autofocus]', dlg)?.focus();
+  return done;
+}
+
+async function askText(title, value = '', okLabel = 'Salvar') {
+  let result = null;
+  await openDialog(
+    `<h2>${esc(title)}</h2>
+     <input name="v" value="${esc(value)}" autofocus required>
+     <div class="dlg-actions">
+       <button class="btn" value="cancel" formnovalidate>Cancelar</button>
+       <button class="btn primary" value="ok">${esc(okLabel)}</button>
+     </div>`,
+    (_, form) => { result = form.v.value.trim(); }
+  );
+  return result || null;
+}
+
+async function confirmBox(msg, okLabel = 'Confirmar', danger = false) {
+  const r = await openDialog(
+    `<p>${esc(msg)}</p>
+     <div class="dlg-actions">
+       <button class="btn" value="cancel">Cancelar</button>
+       <button class="btn ${danger ? 'danger' : 'primary'}" value="ok">${esc(okLabel)}</button>
+     </div>`
+  );
+  return r === 'ok';
+}
+
+// ---------- roteamento ----------
+
+const routes = [
+  [/^#\/repertorios$/, () => renderSetlists()],
+  [/^#\/repertorio\/([\w]+)$/, (id) => renderSetlist(id)],
+  [/^#\/show\/([\w]+)(?:\/(\d+))?$/, (id, i) => startShow({ setlistId: id, start: +(i || 0) })],
+  [/^#\/ver\/([\w]+)$/, (id) => startShow({ songId: id })],
+  [/.*/, () => renderLibrary()],
+];
+
+function route() {
+  const hash = location.hash || '#/musicas';
+  if (!hash.startsWith('#/show') && !hash.startsWith('#/ver')) stopShow();
+  const tab = hash.startsWith('#/repertorio') ? 'repertorios' : 'musicas';
+  document.querySelectorAll('.tabs a').forEach((a) => a.classList.toggle('on', a.dataset.tab === tab));
+  for (const [re, fn] of routes) {
+    const m = hash.match(re);
+    if (m) return fn(...m.slice(1));
+  }
+}
+window.addEventListener('hashchange', route);
+
+// ---------- biblioteca ----------
+
+const libState = { q: '', band: '' };
+
+async function renderLibrary() {
+  const songs = await db.getAll('songs');
+  if (!songs.length) {
+    view.innerHTML = `
+      <div class="empty">
+        <h2>Nenhuma música ainda</h2>
+        <p>Importe as imagens das letras. O nome do arquivo organiza tudo:</p>
+        <code>Banda - Nome da Música 1.jpg</code>
+        <code>Banda - Nome da Música 2.jpg</code>
+        <p class="muted">Números no final viram páginas da mesma música. Se importar uma pasta, o nome da pasta vira a banda quando o arquivo não tiver “Banda - ”.</p>
+        <div class="row">
+          <button class="btn primary" data-action="import">Importar imagens</button>
+          <button class="btn" data-action="import-folder">Importar pasta</button>
+          <button class="btn" data-action="restore">Restaurar backup</button>
+        </div>
+      </div>`;
+    return;
+  }
+
+  const bands = [...new Set(songs.map((s) => s.band))].sort(byBand);
+  view.innerHTML = `
+    <div class="toolbar">
+      <input type="search" id="q" placeholder="Buscar música ou banda…" value="${esc(libState.q)}" autocomplete="off">
+      <span class="muted count"></span>
+    </div>
+    <div class="chips">
+      <button class="chip ${libState.band ? '' : 'on'}" data-band="">Todas</button>
+      ${bands.map((b) => `<button class="chip ${libState.band === b ? 'on' : ''}" data-band="${esc(b)}">${esc(b)}</button>`).join('')}
+    </div>
+    <div id="list"></div>`;
+
+  const draw = () => {
+    const q = norm(libState.q.trim());
+    const filtered = songs.filter(
+      (s) => (!libState.band || s.band === libState.band) &&
+        (!q || norm(s.title).includes(q) || norm(s.band).includes(q))
+    );
+    $('.count', view).textContent = `${filtered.length} música${filtered.length === 1 ? '' : 's'}`;
+    const groups = new Map();
+    filtered.forEach((s) => (groups.get(s.band) || groups.set(s.band, []).get(s.band)).push(s));
+    $('#list', view).innerHTML = [...groups.keys()].sort(byBand).map((band) => `
+      <section class="group">
+        <h3>${esc(band)}</h3>
+        ${groups.get(band).sort(byTitle).map((s) => `
+          <div class="song" data-id="${s.id}">
+            <a class="song-main" href="#/ver/${s.id}">
+              <span class="song-title">${esc(s.title)}</span>
+              ${s.pageCount > 1 ? `<span class="badge">${s.pageCount} págs</span>` : ''}
+            </a>
+            <button class="btn small" data-song="add">+ Repertório</button>
+            <button class="btn small icon" data-song="edit" aria-label="Editar">✎</button>
+          </div>`).join('')}
+      </section>`).join('') || '<p class="muted pad">Nada encontrado.</p>';
+  };
+  draw();
+
+  $('#q', view).addEventListener('input', (e) => { libState.q = e.target.value; draw(); });
+  $('.chips', view).addEventListener('click', (e) => {
+    const chip = e.target.closest('.chip');
+    if (!chip) return;
+    libState.band = chip.dataset.band;
+    view.querySelectorAll('.chip').forEach((c) => c.classList.toggle('on', c === chip));
+    draw();
+  });
+  $('#list', view).addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-song]');
+    if (!btn) return;
+    const song = songs.find((s) => s.id === btn.closest('.song').dataset.id);
+    if (btn.dataset.song === 'add') await addToSetlistDialog(song);
+    if (btn.dataset.song === 'edit') await editSongDialog(song);
+  });
+}
+
+async function editSongDialog(song) {
+  const r = await openDialog(
+    `<h2>Editar música</h2>
+     <label>Banda<input name="band" value="${esc(song.band)}" required></label>
+     <label>Título<input name="title" value="${esc(song.title)}" required autofocus></label>
+     <p class="muted">${song.pageCount} página${song.pageCount === 1 ? '' : 's'}</p>
+     <div class="dlg-actions">
+       <button class="btn danger" value="delete" formnovalidate>Excluir</button>
+       <span class="grow"></span>
+       <button class="btn" value="cancel" formnovalidate>Cancelar</button>
+       <button class="btn primary" value="save">Salvar</button>
+     </div>`,
+    async (action, form) => {
+      if (action !== 'save') return;
+      const band = form.band.value.trim();
+      const title = form.title.value.trim();
+      const key = db.songKey(band, title);
+      const clash = await db.findSongByKey(key);
+      if (clash && clash.id !== song.id) {
+        toast('Já existe uma música com essa banda e título.');
+        return false;
+      }
+      Object.assign(song, { band, title, key, updatedAt: Date.now() });
+      await db.put('songs', song);
+    }
+  );
+  if (r === 'delete') {
+    if (await confirmBox(`Excluir “${song.title}”? Ela também sai dos repertórios.`, 'Excluir', true)) {
+      await db.deleteSong(song.id);
+      toast('Música excluída');
+    }
+  }
+  if (r) route();
+}
+
+async function addToSetlistDialog(song) {
+  const setlists = (await db.getAll('setlists')).sort((a, b) => b.updatedAt - a.updatedAt);
+  const r = await openDialog(
+    `<h2>Adicionar “${esc(song.title)}”</h2>
+     <div class="pick">
+       ${setlists.map((sl) => `
+         <button class="pick-item" value="sl:${sl.id}">
+           <span>${esc(sl.name)}</span>
+           <span class="muted">${sl.items.length} músicas${sl.items.includes(song.id) ? ' · já está' : ''}</span>
+         </button>`).join('')}
+       <button class="pick-item new" value="new">+ Novo repertório</button>
+     </div>
+     <div class="dlg-actions"><button class="btn" value="cancel">Fechar</button></div>`
+  );
+  if (!r) return;
+  let sl;
+  if (r === 'new') {
+    const name = await askText('Nome do repertório', '', 'Criar');
+    if (!name) return;
+    sl = await createSetlist(name);
+  } else {
+    sl = setlists.find((x) => x.id === r.slice(3));
+  }
+  sl.items.push(song.id);
+  sl.updatedAt = Date.now();
+  await db.put('setlists', sl);
+  toast(`Adicionada em “${sl.name}” (posição ${sl.items.length})`);
+}
+
+// ---------- repertórios ----------
+
+async function createSetlist(name) {
+  const sl = { id: db.uid(), name, items: [], createdAt: Date.now(), updatedAt: Date.now() };
+  await db.put('setlists', sl);
+  return sl;
+}
+
+async function renderSetlists() {
+  const setlists = (await db.getAll('setlists')).sort((a, b) => b.updatedAt - a.updatedAt);
+  view.innerHTML = `
+    <div class="toolbar">
+      <h2 class="grow">Repertórios</h2>
+      <button class="btn primary" id="newSl">+ Novo repertório</button>
+    </div>
+    ${setlists.length ? `<div class="cards">${setlists.map((sl) => `
+      <a class="card" href="#/repertorio/${sl.id}">
+        <strong>${esc(sl.name)}</strong>
+        <span class="muted">${sl.items.length} música${sl.items.length === 1 ? '' : 's'}</span>
+      </a>`).join('')}</div>`
+      : '<div class="empty"><p>Nenhum repertório ainda. Crie um e adicione as músicas na ordem do show.</p></div>'}`;
+  $('#newSl').onclick = async () => {
+    const name = await askText('Nome do repertório', '', 'Criar');
+    if (!name) return;
+    const sl = await createSetlist(name);
+    location.hash = `#/repertorio/${sl.id}`;
+  };
+}
+
+async function renderSetlist(id) {
+  const sl = await db.get('setlists', id);
+  if (!sl) { location.hash = '#/repertorios'; return; }
+  const songs = new Map((await db.getAll('songs')).map((s) => [s.id, s]));
+  sl.items = sl.items.filter((sid) => songs.has(sid));
+
+  const save = async () => { sl.updatedAt = Date.now(); await db.put('setlists', sl); };
+
+  view.innerHTML = `
+    <div class="toolbar">
+      <a class="btn ghost" href="#/repertorios">‹</a>
+      <h2 class="grow">${esc(sl.name)}</h2>
+      <button class="btn primary big" id="play" ${sl.items.length ? '' : 'disabled'}>▶ Iniciar show</button>
+    </div>
+    <div class="row wrap">
+      <button class="btn" id="addSongs">+ Adicionar músicas</button>
+      <button class="btn" id="rename">Renomear</button>
+      <button class="btn" id="dup">Duplicar</button>
+      <button class="btn danger" id="delSl">Excluir</button>
+    </div>
+    <ol class="setlist" id="items">
+      ${sl.items.map((sid, i) => {
+        const s = songs.get(sid);
+        return `
+        <li data-i="${i}">
+          <span class="pos">${i + 1}</span>
+          <a class="song-main" href="#/show/${sl.id}/${i}">
+            <span class="song-title">${esc(s.title)}</span>
+            <span class="muted">${esc(s.band)}${s.pageCount > 1 ? ` · ${s.pageCount} págs` : ''}</span>
+          </a>
+          <button class="btn small icon" data-mv="-1" ${i === 0 ? 'disabled' : ''} aria-label="Subir">▲</button>
+          <button class="btn small icon" data-mv="1" ${i === sl.items.length - 1 ? 'disabled' : ''} aria-label="Descer">▼</button>
+          <button class="btn small icon" data-mv="x" aria-label="Remover">✕</button>
+        </li>`;
+      }).join('')}
+    </ol>
+    ${sl.items.length ? '' : '<p class="muted pad">Repertório vazio. Toque em “Adicionar músicas”.</p>'}`;
+
+  $('#play').onclick = () => { enterFullscreen(); location.hash = `#/show/${sl.id}/0`; };
+  $('#items').addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-mv]');
+    if (!btn) return;
+    const i = +btn.closest('li').dataset.i;
+    if (btn.dataset.mv === 'x') sl.items.splice(i, 1);
+    else {
+      const j = i + +btn.dataset.mv;
+      [sl.items[i], sl.items[j]] = [sl.items[j], sl.items[i]];
+    }
+    await save();
+    renderSetlist(id);
+  });
+  $('#rename').onclick = async () => {
+    const name = await askText('Renomear repertório', sl.name);
+    if (!name) return;
+    sl.name = name;
+    await save();
+    renderSetlist(id);
+  };
+  $('#dup').onclick = async () => {
+    const copy = await createSetlist(`${sl.name} (cópia)`);
+    copy.items = [...sl.items];
+    await db.put('setlists', copy);
+    location.hash = `#/repertorio/${copy.id}`;
+  };
+  $('#delSl').onclick = async () => {
+    if (!(await confirmBox(`Excluir o repertório “${sl.name}”? As músicas continuam na biblioteca.`, 'Excluir', true))) return;
+    await db.del('setlists', sl.id);
+    location.hash = '#/repertorios';
+  };
+  $('#addSongs').onclick = async () => {
+    const picked = await pickSongsDialog([...songs.values()], sl.items);
+    if (!picked.length) return;
+    sl.items.push(...picked);
+    await save();
+    toast(`${picked.length} música${picked.length === 1 ? '' : 's'} adicionada${picked.length === 1 ? '' : 's'}`);
+    renderSetlist(id);
+  };
+}
+
+// Seleção múltipla: a ordem dos toques vira a ordem no repertório.
+async function pickSongsDialog(allSongs, already) {
+  const order = [];
+  allSongs.sort((a, b) => byBand(a.band, b.band) || byTitle(a, b));
+  const done = openDialog(
+    `<h2>Adicionar músicas</h2>
+     <input type="search" id="pq" placeholder="Buscar…" autocomplete="off">
+     <div class="pick tall" id="plist"></div>
+     <div class="dlg-actions">
+       <span class="muted grow" id="pcount">Toque na ordem em que vão entrar</span>
+       <button class="btn" value="cancel">Cancelar</button>
+       <button class="btn primary" value="ok">Adicionar</button>
+     </div>`
+  );
+  bindPicker(allSongs, already, order);
+  return (await done) === 'ok' ? order : [];
+}
+
+function bindPicker(allSongs, already, order) {
+  const list = $('#plist', dlg);
+  const draw = () => {
+    const q = norm($('#pq', dlg).value.trim());
+    list.innerHTML = allSongs
+      .filter((s) => !q || norm(s.title).includes(q) || norm(s.band).includes(q))
+      .map((s) => {
+        const n = order.indexOf(s.id);
+        return `<button type="button" class="pick-item ${n >= 0 ? 'sel' : ''}" data-id="${s.id}">
+          <span>${n >= 0 ? `<b class="ord">${n + 1}</b>` : ''}${esc(s.title)}</span>
+          <span class="muted">${esc(s.band)}${already.includes(s.id) ? ' · já está' : ''}</span>
+        </button>`;
+      }).join('');
+    $('#pcount', dlg).textContent = order.length ? `${order.length} selecionada${order.length === 1 ? '' : 's'}` : 'Toque na ordem em que vão entrar';
+  };
+  $('#pq', dlg).addEventListener('input', draw);
+  list.addEventListener('click', (e) => {
+    const item = e.target.closest('.pick-item');
+    if (!item) return;
+    const n = order.indexOf(item.dataset.id);
+    if (n >= 0) order.splice(n, 1); else order.push(item.dataset.id);
+    draw();
+  });
+  draw();
+}
+
+// ---------- modo show ----------
+
+const show = { pages: [], i: 0, url: null, wake: null, title: '', songs: [] };
+const showEl = $('#show');
+const showImg = $('#showImg');
+
+function enterFullscreen() {
+  document.documentElement.requestFullscreen?.().catch(() => {});
+}
+
+async function startShow({ setlistId, songId, start = 0 }) {
+  let songIds;
+  if (setlistId) {
+    const sl = await db.get('setlists', setlistId);
+    if (!sl) { location.hash = '#/repertorios'; return; }
+    songIds = sl.items;
+    show.title = sl.name;
+    show.back = `#/repertorio/${sl.id}`;
+  } else {
+    songIds = [songId];
+    show.title = '';
+    show.back = '#/musicas';
+  }
+  const allSongs = new Map((await db.getAll('songs')).map((s) => [s.id, s]));
+  show.songs = songIds.map((id) => allSongs.get(id)).filter(Boolean);
+  show.pages = [];
+  for (const [si, song] of show.songs.entries()) {
+    const pages = await db.getPages(song.id);
+    pages.forEach((p, pi) => show.pages.push({ si, song, pi, total: pages.length, blob: p.blob }));
+  }
+  if (!show.pages.length) { toast('Sem páginas para mostrar'); location.hash = show.back; return; }
+
+  const firstOfSong = show.pages.findIndex((p) => p.si === start);
+  show.i = Math.max(0, firstOfSong);
+  showEl.hidden = false;
+  document.body.classList.add('showing');
+  showEl.classList.toggle('fit-width', prefs.get('fit', 'screen') === 'width');
+  showEl.classList.add('bars');
+  hideBarsSoon();
+  keepAwake();
+  drawPage();
+}
+
+function stopShow() {
+  if (showEl.hidden) return;
+  showEl.hidden = true;
+  document.body.classList.remove('showing');
+  $('#jumpList').hidden = true;
+  if (show.url) URL.revokeObjectURL(show.url);
+  show.url = null;
+  show.wake?.release().catch(() => {});
+  show.wake = null;
+  if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+}
+
+function drawPage() {
+  const p = show.pages[show.i];
+  if (show.url) URL.revokeObjectURL(show.url);
+  show.url = URL.createObjectURL(p.blob);
+  showImg.src = show.url;
+  $('.show-stage').scrollTo(0, 0);
+
+  const pageInfo = p.total > 1 ? ` · pág ${p.pi + 1}/${p.total}` : '';
+  $('[data-show="jump"]').textContent = `${p.song.title}${pageInfo}`;
+  $('#showPos').textContent = show.songs.length > 1 ? `${p.si + 1}/${show.songs.length} · ${p.song.band}` : p.song.band;
+
+  const next = show.songs[p.si + 1];
+  const lastPage = p.pi === p.total - 1;
+  $('#showNext').textContent = lastPage && next ? `Próxima: ${next.title}` : lastPage ? 'Fim' : `continua → pág ${p.pi + 2}`;
+  showEl.classList.toggle('last-page', lastPage);
+}
+
+function step(d) {
+  const j = show.i + d;
+  if (j < 0 || j >= show.pages.length) {
+    flashBars();
+    return;
+  }
+  show.i = j;
+  drawPage();
+  if (show.pages[j].pi === 0 && d > 0) flashBars();
+}
+
+function flashBars() {
+  showEl.classList.add('bars');
+  hideBarsSoon();
+}
+
+function hideBarsSoon() {
+  clearTimeout(show.barTimer);
+  show.barTimer = setTimeout(() => {
+    if ($('#jumpList').hidden) showEl.classList.remove('bars');
+  }, 2500);
+}
+
+async function keepAwake() {
+  try { show.wake = await navigator.wakeLock?.request('screen'); } catch {}
+}
+document.addEventListener('visibilitychange', () => {
+  if (!showEl.hidden && document.visibilityState === 'visible') keepAwake();
+});
+
+function openJump() {
+  const cur = show.pages[show.i].si;
+  const jl = $('#jumpList');
+  jl.innerHTML = `<h3>${esc(show.title || 'Músicas')}</h3>` + show.songs.map((s, i) =>
+    `<button class="pick-item ${i === cur ? 'sel' : ''}" data-si="${i}">
+      <span><b class="ord">${i + 1}</b>${esc(s.title)}</span><span class="muted">${esc(s.band)}</span>
+    </button>`).join('');
+  jl.hidden = false;
+  showEl.classList.add('bars');
+  jl.querySelector('.sel')?.scrollIntoView({ block: 'center' });
+}
+
+showEl.addEventListener('click', (e) => {
+  const jumpItem = e.target.closest('[data-si]');
+  if (jumpItem) {
+    show.i = show.pages.findIndex((p) => p.si === +jumpItem.dataset.si);
+    $('#jumpList').hidden = true;
+    drawPage();
+    hideBarsSoon();
+    return;
+  }
+  if (!$('#jumpList').hidden && !e.target.closest('#jumpList')) {
+    $('#jumpList').hidden = true;
+    hideBarsSoon();
+    return;
+  }
+  const a = e.target.closest('[data-show]')?.dataset.show;
+  if (a === 'prev') step(-1);
+  else if (a === 'next') step(1);
+  else if (a === 'toggle') { showEl.classList.toggle('bars'); if (showEl.classList.contains('bars')) hideBarsSoon(); }
+  else if (a === 'exit') location.hash = show.back;
+  else if (a === 'jump') openJump();
+  else if (a === 'fit') {
+    const w = !showEl.classList.contains('fit-width');
+    showEl.classList.toggle('fit-width', w);
+    prefs.set('fit', w ? 'width' : 'screen');
+    toast(w ? 'Ajustar à largura (role para ver o resto)' : 'Página inteira na tela', 1600);
+    hideBarsSoon();
+  }
+});
+
+// Swipe horizontal = trocar página.
+let touchStart = null;
+showEl.addEventListener('pointerdown', (e) => { touchStart = { x: e.clientX, y: e.clientY }; });
+showEl.addEventListener('pointerup', (e) => {
+  if (!touchStart) return;
+  const dx = e.clientX - touchStart.x;
+  const dy = e.clientY - touchStart.y;
+  touchStart = null;
+  if (Math.abs(dx) > 70 && Math.abs(dx) > Math.abs(dy) * 1.5) {
+    step(dx < 0 ? 1 : -1);
+    showEl.dataset.swiped = '1';
+    setTimeout(() => delete showEl.dataset.swiped, 50);
+  }
+});
+showEl.addEventListener('click', (e) => { if (showEl.dataset.swiped) e.stopImmediatePropagation(); }, true);
+
+// Teclado e pedal Bluetooth (a maioria manda setas ou PageUp/PageDown).
+document.addEventListener('keydown', (e) => {
+  if (showEl.hidden) return;
+  if (['ArrowRight', 'ArrowDown', 'PageDown', ' ', 'Enter'].includes(e.key)) { e.preventDefault(); step(1); }
+  else if (['ArrowLeft', 'ArrowUp', 'PageUp', 'Backspace'].includes(e.key)) { e.preventDefault(); step(-1); }
+  else if (e.key === 'Escape') location.hash = show.back;
+});
+
+// ---------- ações globais ----------
+
+async function runImport(files) {
+  if (!files.length) return;
+  const t = $('#toast');
+  clearTimeout(toast.timer);
+  t.classList.add('on');
+  try {
+    const r = await importFiles(files, (n, total) => { t.textContent = `Importando ${n}/${total}…`; });
+    toast(`${r.files} imagem${r.files === 1 ? '' : 'ns'} → ${r.songs} música${r.songs === 1 ? '' : 's'}${r.skipped ? ` (${r.skipped} arquivo(s) ignorado(s))` : ''}`, 4000);
+  } catch (err) {
+    toast(`Erro na importação: ${err.message}`, 5000);
+  }
+  route();
+}
+
+$('#fileInput').addEventListener('change', (e) => { runImport(e.target.files); e.target.value = ''; });
+$('#folderInput').addEventListener('change', (e) => { runImport(e.target.files); e.target.value = ''; });
+$('#backupInput').addEventListener('change', async (e) => {
+  const f = e.target.files[0];
+  e.target.value = '';
+  if (!f) return;
+  try {
+    toast('Restaurando backup…', 60000);
+    const r = await importBackup(f);
+    toast(`Backup restaurado: ${r.songs} músicas, ${r.setlists} repertórios`, 4000);
+  } catch (err) {
+    toast(err.message, 5000);
+  }
+  route();
+});
+
+async function menuDialog() {
+  const est = await navigator.storage?.estimate?.().catch(() => null);
+  const used = est ? `${(est.usage / 1048576).toFixed(0)} MB usados` : '';
+  const r = await openDialog(
+    `<h2>Opções</h2>
+     <div class="pick">
+       <button class="pick-item" value="import-folder">Importar pasta inteira</button>
+       <button class="pick-item" value="backup">Exportar backup (.json)</button>
+       <button class="pick-item" value="restore">Restaurar backup</button>
+       <button class="pick-item danger" value="wipe">Apagar tudo deste aparelho</button>
+     </div>
+     <p class="muted">${used}</p>
+     <div class="dlg-actions"><button class="btn" value="cancel">Fechar</button></div>`
+  );
+  if (r === 'import-folder') $('#folderInput').click();
+  if (r === 'restore') $('#backupInput').click();
+  if (r === 'backup') { toast('Gerando backup…', 30000); await exportBackup(); toast('Backup gerado'); }
+  if (r === 'wipe' && (await confirmBox('Apagar todas as músicas e repertórios deste tablet? Isso não tem volta.', 'Apagar tudo', true))) {
+    await db.clearAll();
+    toast('Tudo apagado');
+    route();
+  }
+}
+
+document.addEventListener('click', (e) => {
+  const a = e.target.closest('[data-action]')?.dataset.action;
+  if (a === 'import') $('#fileInput').click();
+  if (a === 'import-folder') $('#folderInput').click();
+  if (a === 'restore') $('#backupInput').click();
+  if (a === 'menu') menuDialog();
+});
+
+// ---------- inicialização ----------
+
+// Pede ao Android para não apagar os dados quando faltar espaço.
+navigator.storage?.persist?.().catch(() => {});
+
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('sw.js').catch(() => {});
+}
+
+route();
