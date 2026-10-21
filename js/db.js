@@ -68,6 +68,15 @@ export async function put(name, value) {
   return promisify((await store(name, 'readwrite')).put(value));
 }
 
+// Como put, mas só resolve quando a transação foi gravada no disco.
+// Usado em cargas grandes (restaurar backup) para não acumular gravações pendentes na memória.
+export async function putDurable(name, value) {
+  const db = await open();
+  const tx = db.transaction(name, 'readwrite');
+  tx.objectStore(name).put(value);
+  return txDone(tx);
+}
+
 export async function del(name, id) {
   return promisify((await store(name, 'readwrite')).delete(id));
 }

@@ -44,7 +44,7 @@ export async function* scanBackup(file) {
   const reader = file.stream().pipeThrough(new TextDecoderStream()).getReader();
   const re = /["{}\[\]:,]/g;
   let s = '';
-  let i = 0;
+  let scanned = 0; // até onde `s` já foi lido
   let depth = 0;
   let lastStr = null;
   let curKey = null;
@@ -54,7 +54,8 @@ export async function* scanBackup(file) {
     const { done, value } = await reader.read();
     if (done) break;
     s += value;
-    re.lastIndex = i;
+    re.lastIndex = scanned;
+    scanned = s.length;
     let m;
     while ((m = re.exec(s))) {
       const c = m[0];
@@ -69,7 +70,7 @@ export async function* scanBackup(file) {
           if (b % 2 === 0) break;
           q++;
         }
-        if (q < 0) { re.lastIndex = p; break; } // string cortada no meio: espera o próximo pedaço
+        if (q < 0) { scanned = p; break; } // string cortada no meio: espera o próximo pedaço
         re.lastIndex = q + 1;
         if (depth === 1) {
           if (afterColon) { yield { key: curKey, value: JSON.parse(s.slice(p, q + 1)) }; afterColon = false; }
@@ -93,10 +94,9 @@ export async function* scanBackup(file) {
       }
     }
     // descarta o que já foi processado, guardando só o elemento em andamento
-    const cut = elemStart >= 0 ? elemStart : Math.min(re.lastIndex, s.length);
+    const cut = elemStart >= 0 ? elemStart : scanned;
     s = s.slice(cut);
-    re.lastIndex -= cut;
-    i = re.lastIndex;
+    scanned -= cut;
     if (elemStart >= 0) elemStart = 0;
   }
 }
@@ -117,9 +117,9 @@ export async function importBackup(file, onProgress) {
       await db.put('songs', value);
       songs++;
     } else if (key === 'pages') {
-      await db.put('pages', { id: value.id, songId: value.songId, n: value.n, blob: await dataURLToBlob(value.data) });
+      await db.putDurable('pages', { id: value.id, songId: value.songId, n: value.n, blob: await dataURLToBlob(value.data) });
       pages++;
-      if (onProgress && pages % 10 === 0) onProgress(pages);
+      if (onProgress && pages % 5 === 0) onProgress(pages);
     } else if (key === 'setlists') {
       await db.put('setlists', value);
       setlists++;

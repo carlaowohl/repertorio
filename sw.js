@@ -1,6 +1,6 @@
 // Guarda o app no aparelho para abrir sem internet.
 // Ao publicar uma versão nova, aumente o número abaixo.
-const CACHE = 'repertorio-v4';
+const CACHE = 'repertorio-v5';
 const ASSETS = [
   './',
   'index.html',
