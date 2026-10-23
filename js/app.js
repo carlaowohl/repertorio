@@ -1,6 +1,7 @@
 import * as db from './db.js';
 import { importFiles, NO_BAND } from './importer.js';
 import { exportBackup, importBackup } from './backup.js';
+import { syncAll, lastSyncText } from './sync.js';
 import { matchList, collapse, splitTitle } from './matcher.js';
 import { suggestArtists } from './artists.js';
 
@@ -888,12 +889,28 @@ $('#backupInput').addEventListener('change', async (e) => {
   route();
 });
 
+let syncing = false;
+async function runSync() {
+  if (syncing) return;
+  syncing = true;
+  try {
+    const r = await syncAll((msg) => toast(msg, 120000));
+    toast(`Sincronizado: ${r.songs} músicas, ${r.setlists} repertórios (${r.enviadas} enviadas, ${r.baixadas} baixadas)`, 6000);
+  } catch (err) {
+    toast(`Erro ao sincronizar: ${err.message}`, 9000);
+  }
+  syncing = false;
+  route();
+}
+
 async function menuDialog() {
   const est = await navigator.storage?.estimate?.().catch(() => null);
-  const used = est ? `${(est.usage / 1048576).toFixed(0)} MB usados` : '';
+  const last = lastSyncText();
+  const used = [est ? `${(est.usage / 1048576).toFixed(0)} MB usados` : '', last ? `Última sincronização: ${last}` : ''].filter(Boolean).join(' · ');
   const r = await openDialog(
     `<h2>Opções</h2>
      <div class="pick">
+       <button class="pick-item" value="sync">Sincronizar com o Drive</button>
        <button class="pick-item" value="import-folder">Importar pasta inteira</button>
        <button class="pick-item" value="backup">Exportar backup (.json)</button>
        <button class="pick-item" value="restore">Restaurar backup</button>
@@ -902,6 +919,7 @@ async function menuDialog() {
      <p class="muted">${used}</p>
      <div class="dlg-actions"><button class="btn" value="cancel">Fechar</button></div>`
   );
+  if (r === 'sync') runSync();
   if (r === 'import-folder') $('#folderInput').click();
   if (r === 'restore') $('#backupInput').click();
   if (r === 'backup') { toast('Gerando backup…', 30000); await exportBackup(); toast('Backup gerado'); }
@@ -917,6 +935,7 @@ document.addEventListener('click', (e) => {
   if (a === 'import') $('#fileInput').click();
   if (a === 'import-folder') $('#folderInput').click();
   if (a === 'restore') $('#backupInput').click();
+  if (a === 'sync') runSync();
   if (a === 'menu') menuDialog();
 });
 

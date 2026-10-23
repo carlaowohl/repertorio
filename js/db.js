@@ -77,7 +77,31 @@ export async function putDurable(name, value) {
   return txDone(tx);
 }
 
-export async function del(name, id) {
+// Exclusões feitas neste aparelho, para a sincronização apagar também nos outros.
+// { songs: { id: timestamp }, setlists: { id: timestamp } }
+const TOMB_KEY = 'repertorio.tombstones';
+
+export function getTombstones() {
+  try {
+    const t = JSON.parse(localStorage.getItem(TOMB_KEY) || '{}');
+    return { songs: t.songs || {}, setlists: t.setlists || {} };
+  } catch {
+    return { songs: {}, setlists: {} };
+  }
+}
+
+export function saveTombstones(t) {
+  try { localStorage.setItem(TOMB_KEY, JSON.stringify(t)); } catch { /* sem localStorage: a exclusão fica só neste aparelho */ }
+}
+
+function addTombstone(kind, id) {
+  const t = getTombstones();
+  t[kind][id] = Date.now();
+  saveTombstones(t);
+}
+
+export async function del(name, id, remember = true) {
+  if (name === 'setlists' && remember) addTombstone('setlists', id);
   return promisify((await store(name, 'readwrite')).delete(id));
 }
 
@@ -96,7 +120,9 @@ export async function putPage(songId, n, blob) {
   return put('pages', { id: `${songId}#${n}`, songId, n, blob });
 }
 
-export async function deleteSong(songId) {
+// remember=false é usado pela sincronização, que aplica exclusões vindas de outro aparelho.
+export async function deleteSong(songId, remember = true) {
+  if (remember) addTombstone('songs', songId);
   const db = await open();
   const tx = db.transaction(['songs', 'pages', 'setlists'], 'readwrite');
   tx.objectStore('songs').delete(songId);
