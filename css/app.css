@@ -161,6 +161,12 @@ dialog p { margin: 0; }
 .pick-item.sel { border-color: var(--accent); background: #2b2416; }
 .pick-item.new { color: var(--accent); font-weight: 600; }
 .pick-item.danger { color: var(--danger); }
+.pg {
+  display: flex; align-items: center; gap: 12px; padding: 8px 12px;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px;
+}
+.pg img { width: 56px; height: 76px; object-fit: cover; object-position: top; background: #fff; border-radius: 4px; }
+[data-swap] { align-self: flex-start; }
 .ord {
   display: inline-grid; place-items: center; min-width: 1.6em; height: 1.6em; margin-right: 8px;
   background: var(--accent); color: var(--accent-ink); border-radius: 999px; font-size: .8rem;

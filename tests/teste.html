@@ -5,6 +5,7 @@
 <script type="module">
 import * as db from '../js/db.js';
 import { parseFileName, importFiles } from '../js/importer.js';
+import * as manut from '../js/library.js';
 
 const out = [];
 const show = () => { document.getElementById('out').textContent = out.join('\n'); };
@@ -72,6 +73,100 @@ try {
   await importFiles([await fakeImage('Canção Longa 2.png', 'P2')]);
   const cl = (await db.getAll('songs')).filter((s) => s.title === 'Canção Longa');
   ok(cl.length === 1 && cl[0].band === 'Banda Z' && cl[0].pageCount === 2, `página sem banda entra na música existente: ${JSON.stringify(cl.map((s) => [s.band, s.pageCount]))}`);
+
+  await db.clearAll();
+
+  // ---- nomes de arquivo mais soltos ----
+  r = p('Banda- Musica Nova 2.jpg');
+  ok(r.band === 'Banda' && r.title === 'Musica Nova' && r.page === 2, `hífen sem espaço antes do título: ${JSON.stringify(r)}`);
+  r = p('Banda -Musica Nova.jpg');
+  ok(r.band === 'Banda' && r.title === 'Musica Nova', `hífen sem espaço depois: ${JSON.stringify(r)}`);
+  r = p('Banda – Musica Nova 3.jpg');
+  ok(r.band === 'Banda' && r.title === 'Musica Nova' && r.page === 3, `travessão: ${JSON.stringify(r)}`);
+  r = p('Jota-Quest - Sozinho.jpg');
+  ok(r.band === 'Jota-Quest' && r.title === 'Sozinho', `hífen dentro do nome da banda: ${JSON.stringify(r)}`);
+  r = p('Sozinho -2.jpg');
+  ok(r.band === 'Sem banda', `"Título -2" não vira banda: ${JSON.stringify(r)}`);
+
+  // ---- maiúsculas e minúsculas ----
+  const sized = (name, w, h = 600) => {
+    const c = document.createElement('canvas');
+    c.width = w; c.height = h;
+    const g = c.getContext('2d');
+    g.fillStyle = '#fff'; g.fillRect(0, 0, w, h);
+    return new Promise((res) => c.toBlob((b) => res(new File([b], name, { type: 'image/png' })), 'image/png'));
+  };
+  const imp = async (...list) => importFiles(await Promise.all(list.map(([n, w]) => sized(n, w))));
+  const widths = async (songId) => Promise.all((await db.getPages(songId)).map(async (pg) => (await createImageBitmap(pg.blob)).width));
+  const byTitleName = async (t) => (await db.getAll('songs')).find((s) => s.title === t);
+
+  await imp(['Banda Q - Cancao Alfa 1.png', 300], ['banda q - CANCAO ALFA 2.png', 400]);
+  let all = await db.getAll('songs');
+  ok(all.length === 1 && all[0].band === 'Banda Q' && all[0].pageCount === 2, `maiúsculas diferentes são a mesma música: ${JSON.stringify(all.map((s) => [s.band, s.title, s.pageCount]))}`);
+  await imp(['BANDA Q - Outra Faixa.png', 300]);
+  all = await db.getAll('songs');
+  ok(all.length === 2 && all.every((s) => s.band === 'Banda Q'), 'banda nova usa a grafia que já existe');
+
+  await db.clearAll();
+  const mk = (id, band, title) => ({ id, band, title, key: db.songKey(band, title), pageCount: 1, createdAt: 1, updatedAt: 1 });
+  await db.put('songs', mk('s1', 'legião urbana', 'Tempo Perdido'));
+  await db.put('songs', mk('s2', 'Legião Urbana', 'Pais e Filhos'));
+  await db.put('songs', mk('s3', 'LEGIÃO URBANA', 'Eduardo e Monica'));
+  const changed = await manut.standardizeBands();
+  all = await db.getAll('songs');
+  ok(changed === 2 && all.every((s) => s.band === 'Legião Urbana'), `bandas com grafias diferentes viram uma só: ${changed} mudaram, ${[...new Set(all.map((s) => s.band))].join('/')}`);
+  ok((await manut.standardizeBands()) === 0, 'padronizar de novo não muda nada');
+
+  const s1 = await db.get('songs', 's1');
+  let rb = await manut.resolveBand(s1, 'Legião urbana');
+  ok(rb.renameAll === true && rb.band === 'Legião urbana', `mudar só a grafia vale para a banda toda: ${JSON.stringify(rb)}`);
+  ok((await manut.renameBand('Legião Urbana', 'Legião urbana')) === 3, 'renomear banda muda todas as músicas dela');
+  await db.put('songs', mk('s4', 'Outra', 'Qualquer'));
+  rb = await manut.resolveBand(await db.get('songs', 's4'), 'LEGIÃO URBANA');
+  ok(rb.renameAll === false && rb.band === 'Legião urbana', `ir para banda existente usa a grafia dela: ${JSON.stringify(rb)}`);
+
+  // ---- juntar músicas ----
+  await db.clearAll();
+  await imp(['Banda M - Faixa 1.png', 300], ['Banda M - Faixa 2.png', 400], ['Banda M - Parte Final.png', 500], ['Banda M - Intro.png', 200]);
+  const A = await byTitleName('Faixa');
+  const B = await byTitleName('Parte Final');
+  const I = await byTitleName('Intro');
+  await db.put('setlists', { id: 'sl-a', name: 'Os dois', items: [B.id, A.id], createdAt: 1, updatedAt: 1 });
+  await db.put('setlists', { id: 'sl-b', name: 'So B', items: ['x', B.id], createdAt: 1, updatedAt: 1 });
+  let res2 = await manut.mergeSongs(A.id, B.id, 'end');
+  ok(res2.pages === 3 && (await widths(A.id)).join() === '300,400,500', `juntar no fim mantém a ordem: ${(await widths(A.id)).join()}`);
+  ok(!(await db.get('songs', B.id)) && (await db.getPages(B.id)).length === 0, 'música de origem some, com as páginas');
+  ok(!!db.getTombstones().songs[B.id], 'exclusão da origem fica registrada para a sincronização');
+  ok((await db.get('setlists', 'sl-a')).items.join() === A.id, 'repertório com as duas fica com uma entrada só');
+  ok((await db.get('setlists', 'sl-b')).items.join() === `x,${A.id}`, 'repertório com a origem passa a apontar para o destino');
+  res2 = await manut.mergeSongs(A.id, I.id, 'start');
+  ok(res2.pages === 4 && (await widths(A.id)).join() === '200,300,400,500', `juntar no início: ${(await widths(A.id)).join()}`);
+  ok((await db.get('songs', A.id)).pageCount === 4, 'contagem de páginas atualizada');
+
+  // ---- reordenar páginas ----
+  await manut.reorderPages(A.id, [4, 3, 2, 1]);
+  ok((await widths(A.id)).join() === '500,400,300,200', `reordenar páginas: ${(await widths(A.id)).join()}`);
+  let threw = false;
+  try { await manut.reorderPages(A.id, [1, 1, 2, 3]); } catch { threw = true; }
+  ok(threw && (await widths(A.id)).join() === '500,400,300,200', 'ordem inválida é recusada sem mexer nas páginas');
+
+  // numeração com buraco (páginas 1 e 5) não deixa sobra ao juntar
+  await imp(['Banda G - Buraco 1.png', 300], ['Banda G - Buraco 5.png', 400], ['Banda G - Extra.png', 500]);
+  const G = await byTitleName('Buraco');
+  const X = await byTitleName('Extra');
+  await manut.mergeSongs(G.id, X.id, 'end');
+  ok((await db.getPages(G.id)).map((pg) => pg.n).join() === '1,2,3', `páginas renumeradas sem buraco: ${(await db.getPages(G.id)).map((pg) => pg.n).join()}`);
+
+  // ---- achar repetidas ----
+  const dupSongs = [
+    mk('d1', 'Banda S', 'Estrela'), mk('d2', 'Estrela', 'Banda S'),          // trocados
+    mk('d3', 'Banda T', 'Rua. Velha'), mk('d4', 'Banda T', 'Rua Velha'),      // pontuação
+    mk('d5', 'Sem banda', 'Lua Cheia'), mk('d6', 'Banda U', 'Lua Cheia'),     // sem banda
+    mk('d7', 'Banda V', 'Sol'), mk('d8', 'Banda W', 'Sol'),                   // regravação: não é repetida
+  ];
+  const dups = manut.findDuplicates(dupSongs);
+  const dsum = dups.map((d) => `${d.a.id}+${d.b.id}`).sort().join(' ');
+  ok(dsum === 'd1+d2 d3+d4 d5+d6', `repetidas encontradas, sem confundir regravações: ${dsum}`);
 
   await db.clearAll();
 

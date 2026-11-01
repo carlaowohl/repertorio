@@ -9,11 +9,19 @@ App pessoal do Carlão (músico) para tablet Android: letras de música em image
 ## Estrutura
 - `js/app.js` — telas (hash routes `#/musicas`, `#/repertorios`, `#/repertorio/:id`, `#/colar`, `#/artistas`, `#/show/:id/:i`, `#/ver/:id`), diálogos, modo show.
 - `js/db.js` — IndexedDB (`songs`, `pages`, `setlists`).
+- `js/names.js` — comparação de nomes sem ligar para maiúsculas/acentos (`fold`, `loose`), `NO_BAND` e a grafia única de cada banda (`bandNames`).
+- `js/library.js` — manutenção da biblioteca: `mergeSongs`, `reorderPages`, `standardizeBands`, `renameBand`, `resolveBand`, `findDuplicates`. Sem tela, testado em `tests/teste.html`.
+- `js/sync.js` — sincronização pelo Google Drive (`appDataFolder`, pasta oculta; sem pasta visível no Drive).
 - `js/importer.js` — lê `Banda - Música 2.jpg` (número final = página), reduz para JPEG 2400px.
 - `js/matcher.js` — "Montar pela lista": texto colado do grupo → sequência, com busca aproximada.
 - `js/artists.js` — sugere artista via MusicBrainz (soma gravações por artista, 1 req/s).
 - `js/backup.js` — exporta/importa tudo num `.json`.
 - `sw.js` — cache offline. **Ao mudar qualquer arquivo, subir `CACHE` (`repertorio-vN`) e listar arquivos novos em `ASSETS`.**
+
+## Cuidados
+- `openDialog` (app.js): o evento `close` da janela anterior chega depois que a próxima já abriu; o handler ignora `close` enquanto `dlg.open` (senão "Excluir" → confirmação fechava sozinha).
+- A chave da música (`songKey`) ignora maiúsculas, acentos e espaços; a pontuação não. Duplicadas por pontuação são achadas em Opções > Achar músicas repetidas.
+- Junção de músicas apaga a origem com tombstone (vale na sincronização) e renumera as páginas 1..N.
 
 ## Testar
 - `servir.ps1` sobe http://localhost:8080. Testes automáticos em `/tests/teste.html` (devem dar "RESULTADO: TUDO OK").
@@ -21,7 +29,7 @@ App pessoal do Carlão (músico) para tablet Android: letras de música em image
 - Nunca usar letras reais em testes, só imagens geradas com texto genérico.
 
 ## Ideias combinadas para as próximas versões
-1. Sincronização via pasta do Google Drive (precisa de OAuth client ID no Google Cloud).
+1. ~~Sincronização via Google Drive~~ (feita, `js/sync.js`).
 2. Anotações por música no repertório (tom, capo, "BIS") mostradas no show.
 3. Zoom, brilho e cores invertidas no modo show.
 4. Histórico de shows.

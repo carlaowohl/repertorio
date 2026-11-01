@@ -4,6 +4,8 @@ import { exportBackup, importBackup } from './backup.js';
 import { syncAll, lastSyncText } from './sync.js';
 import { matchList, collapse, splitTitle } from './matcher.js';
 import { suggestArtists } from './artists.js';
+import { fold, bandNames } from './names.js';
+import { mergeSongs, reorderPages, standardizeBands, renameBand, resolveBand, findDuplicates } from './library.js';
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const view = $('#view');
@@ -38,14 +40,22 @@ function openDialog(html, onSubmit) {
   dlg.innerHTML = `<form method="dialog">${html}</form>`;
   const form = $('form', dlg);
   const done = new Promise((resolve) => {
+    // O evento "close" chega depois que a janela fecha. Se outra janela já abriu nesse meio tempo
+    // (ex.: Excluir -> "Tem certeza?"), o "close" da anterior não pode fechar a nova.
+    const onClose = () => {
+      if (dlg.open) return;
+      dlg.removeEventListener('close', onClose);
+      resolve(null);
+    };
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
       const action = e.submitter?.value || 'ok';
       if (action !== 'cancel' && onSubmit && (await onSubmit(action, form)) === false) return;
+      dlg.removeEventListener('close', onClose);
       resolve(action === 'cancel' ? null : action);
       dlg.close();
     });
-    dlg.addEventListener('close', () => resolve(null), { once: true });
+    dlg.addEventListener('close', onClose);
   });
   dlg.showModal();
   $('[autofocus]', dlg)?.focus();
@@ -106,6 +116,9 @@ window.addEventListener('hashchange', route);
 const libState = { q: '', band: '' };
 
 async function renderLibrary() {
+  // Banda escrita de jeitos diferentes ("legião urbana" / "Legião Urbana") vira uma só.
+  const fixed = await standardizeBands();
+  if (fixed) toast(`Padronizei o nome da banda em ${fixed} música${fixed === 1 ? '' : 's'}.`, 4000);
   const songs = await db.getAll('songs');
   if (!songs.length) {
     view.innerHTML = `
@@ -124,7 +137,8 @@ async function renderLibrary() {
     return;
   }
 
-  const bands = [...new Set(songs.map((s) => s.band))].sort(byBand);
+  const names = bandNames(songs); // chave da banda (sem maiúsculas/acentos) -> nome para mostrar
+  const bandKeys = [...names.keys()].sort((a, b) => byBand(names.get(a), names.get(b)));
   const noBand = songs.filter((s) => s.band === NO_BAND).length;
   view.innerHTML = `
     ${noBand ? `<a class="banner" href="#/artistas">
@@ -137,23 +151,26 @@ async function renderLibrary() {
     </div>
     <div class="chips">
       <button class="chip ${libState.band ? '' : 'on'}" data-band="">Todas</button>
-      ${bands.map((b) => `<button class="chip ${libState.band === b ? 'on' : ''}" data-band="${esc(b)}">${esc(b)}</button>`).join('')}
+      ${bandKeys.map((k) => `<button class="chip ${libState.band === k ? 'on' : ''}" data-band="${esc(k)}">${esc(names.get(k))}</button>`).join('')}
     </div>
     <div id="list"></div>`;
 
   const draw = () => {
     const q = norm(libState.q.trim());
     const filtered = songs.filter(
-      (s) => (!libState.band || s.band === libState.band) &&
+      (s) => (!libState.band || fold(s.band) === libState.band) &&
         (!q || norm(s.title).includes(q) || norm(s.band).includes(q))
     );
     $('.count', view).textContent = `${filtered.length} música${filtered.length === 1 ? '' : 's'}`;
     const groups = new Map();
-    filtered.forEach((s) => (groups.get(s.band) || groups.set(s.band, []).get(s.band)).push(s));
-    $('#list', view).innerHTML = [...groups.keys()].sort(byBand).map((band) => `
+    filtered.forEach((s) => {
+      const k = fold(s.band);
+      (groups.get(k) || groups.set(k, []).get(k)).push(s);
+    });
+    $('#list', view).innerHTML = [...groups.keys()].sort((a, b) => byBand(names.get(a), names.get(b))).map((k) => `
       <section class="group">
-        <h3>${esc(band)}</h3>
-        ${groups.get(band).sort(byTitle).map((s) => `
+        <h3>${esc(names.get(k))}</h3>
+        ${groups.get(k).sort(byTitle).map((s) => `
           <div class="song" data-id="${s.id}">
             <a class="song-main" href="#/ver/${s.id}">
               <span class="song-title">${esc(s.title)}</span>
@@ -184,11 +201,17 @@ async function renderLibrary() {
 }
 
 async function editSongDialog(song) {
-  const r = await openDialog(
+  let clash = null; // outra música com a mesma banda e título: oferece juntar depois de fechar
+  const done = openDialog(
     `<h2>Editar música</h2>
      <label>Banda<input name="band" value="${esc(song.band)}" required></label>
+     <button type="button" class="btn small" data-swap>⇄ Trocar banda e título</button>
      <label>Título<input name="title" value="${esc(song.title)}" required autofocus></label>
      <p class="muted">${song.pageCount} página${song.pageCount === 1 ? '' : 's'}</p>
+     <div class="pick">
+       <button class="pick-item" value="merge" formnovalidate>Juntar com outra música…</button>
+       ${song.pageCount > 1 ? '<button class="pick-item" value="pages" formnovalidate>Reordenar páginas…</button>' : ''}
+     </div>
      <div class="dlg-actions">
        <button class="btn danger" value="delete" formnovalidate>Excluir</button>
        <span class="grow"></span>
@@ -197,25 +220,160 @@ async function editSongDialog(song) {
      </div>`,
     async (action, form) => {
       if (action !== 'save') return;
-      const band = form.band.value.trim();
       const title = form.title.value.trim();
+      // Só mudou maiúsculas/minúsculas da banda: vale para todas as músicas dela.
+      // Banda que já existe com outra grafia: usa a que já existe.
+      const { band, renameAll } = await resolveBand(song, form.band.value.trim());
       const key = db.songKey(band, title);
-      const clash = await db.findSongByKey(key);
-      if (clash && clash.id !== song.id) {
-        toast('Já existe uma música com essa banda e título.');
-        return false;
-      }
+      const other = await db.findSongByKey(key);
+      if (other && other.id !== song.id) { clash = other; return; }
+      if (renameAll) await renameBand(song.band, band);
       Object.assign(song, { band, title, key, updatedAt: Date.now() });
       await db.put('songs', song);
     }
   );
+  $('[data-swap]', dlg).addEventListener('click', () => {
+    const f = $('form', dlg);
+    if (fold(f.band.value) === fold(NO_BAND)) { toast('Esta música está sem banda, não há o que trocar.'); return; }
+    [f.band.value, f.title.value] = [f.title.value, f.band.value];
+  });
+  const r = await done;
   if (r === 'delete') {
     if (await confirmBox(`Excluir “${song.title}”? Ela também sai dos repertórios.`, 'Excluir', true)) {
       await db.deleteSong(song.id);
       toast('Música excluída');
     }
+  } else if (r === 'merge') {
+    await mergeFlow(song);
+    return;
+  } else if (r === 'pages') {
+    await pagesDialog(song);
+  } else if (r === 'save' && clash) {
+    const msg = `Já existe “${clash.title}” de ${clash.band}. Juntar as duas músicas numa só?`;
+    if (await confirmBox(msg, 'Juntar')) {
+      await mergeFlow(song, clash);
+      return;
+    }
   }
   if (r) route();
+}
+
+const songLabel = (s) => `${s.title} (${s.band})`;
+
+// Junta duas músicas: pergunta qual nome fica e em que ordem entram as páginas.
+// Retorna true se juntou.
+async function mergeFlow(a, b = null) {
+  if (!b) {
+    const others = (await db.getAll('songs')).filter((s) => s.id !== a.id);
+    const id = await searchOneDialog(others, a.title);
+    if (!id) return false;
+    b = others.find((s) => s.id === id);
+  }
+  let pick = null;
+  const keepB = a.band === NO_BAND && b.band !== NO_BAND; // sugere o nome da que tem banda
+  const r = await openDialog(
+    `<h2>Juntar músicas</h2>
+     <p class="muted">As páginas das duas viram uma música só.</p>
+     <label>Nome que fica
+       <select name="keep">
+         <option value="a">${esc(songLabel(a))}${a.pageCount > 1 ? ` · ${a.pageCount} págs` : ''}</option>
+         <option value="b" ${keepB ? 'selected' : ''}>${esc(songLabel(b))}${b.pageCount > 1 ? ` · ${b.pageCount} págs` : ''}</option>
+       </select>
+     </label>
+     <label>Ordem das páginas
+       <select name="first">
+         <option value="a">${esc(a.title)} primeiro, depois ${esc(b.title)}</option>
+         <option value="b">${esc(b.title)} primeiro, depois ${esc(a.title)}</option>
+       </select>
+     </label>
+     <div class="dlg-actions">
+       <button class="btn" value="cancel" formnovalidate>Cancelar</button>
+       <button class="btn primary" value="ok">Juntar</button>
+     </div>`,
+    (_, form) => { pick = { keep: form.keep.value, first: form.first.value }; }
+  );
+  if (r !== 'ok' || !pick) return false;
+  const target = pick.keep === 'a' ? a : b;
+  const source = target === a ? b : a;
+  const where = pick.first === pick.keep ? 'end' : 'start'; // páginas da outra depois (end) ou antes (start)
+  try {
+    const res = await mergeSongs(target.id, source.id, where);
+    toast(`Juntadas: “${target.title}” agora tem ${res.pages} página${res.pages === 1 ? '' : 's'}.`, 4000);
+  } catch (err) {
+    toast(`Não consegui juntar: ${err.message}`, 5000);
+    return false;
+  }
+  route();
+  return true;
+}
+
+// Mostra as páginas em miniatura e deixa subir/descer.
+async function pagesDialog(song) {
+  const pages = await db.getPages(song.id);
+  const urls = pages.map((p) => URL.createObjectURL(p.blob));
+  const order = pages.map((_, i) => i); // posições em `pages`, na ordem de exibição
+  const done = openDialog(
+    `<h2>Ordem das páginas</h2>
+     <p class="muted">${esc(songLabel(song))}</p>
+     <div class="pick tall" id="plist"></div>
+     <div class="dlg-actions">
+       <button class="btn" value="cancel" formnovalidate>Cancelar</button>
+       <button class="btn primary" value="save">Salvar</button>
+     </div>`,
+    async (action) => {
+      if (action !== 'save') return;
+      try {
+        await reorderPages(song.id, order.map((i) => pages[i].n));
+      } catch (err) {
+        toast(`Não consegui salvar a ordem: ${err.message}`, 5000);
+        return false;
+      }
+    }
+  );
+  const draw = () => {
+    $('#plist', dlg).innerHTML = order.map((i, pos) => `
+      <div class="pg">
+        <img src="${urls[i]}" alt="">
+        <b>Página ${pos + 1}</b>
+        <span class="grow"></span>
+        <button type="button" class="btn small" data-mv="${pos}" data-d="-1" ${pos === 0 ? 'disabled' : ''}>↑</button>
+        <button type="button" class="btn small" data-mv="${pos}" data-d="1" ${pos === order.length - 1 ? 'disabled' : ''}>↓</button>
+      </div>`).join('');
+  };
+  $('#plist', dlg).addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-mv]');
+    if (!btn) return;
+    const pos = +btn.dataset.mv;
+    const to = pos + +btn.dataset.d;
+    [order[pos], order[to]] = [order[to], order[pos]];
+    draw();
+  });
+  draw();
+  const r = await done;
+  urls.forEach((u) => URL.revokeObjectURL(u));
+  if (r === 'save') toast('Ordem das páginas salva');
+}
+
+// Procura músicas que parecem a mesma (nome trocado, pontuação diferente, sem banda) e deixa juntar.
+async function duplicatesDialog() {
+  const pairs = findDuplicates(await db.getAll('songs'));
+  if (!pairs.length) { toast('Não achei músicas repetidas.'); return; }
+  const pg = (s) => (s.pageCount > 1 ? ` · ${s.pageCount} págs` : '');
+  const r = await openDialog(
+    `<h2>Músicas que parecem repetidas</h2>
+     <p class="muted">${pairs.length} par${pairs.length === 1 ? '' : 'es'}. Toque em um par para juntar.</p>
+     <div class="pick tall">
+       ${pairs.map((p, i) => `
+         <button class="pick-item" value="${i}">
+           <span>${esc(p.a.title)} — ${esc(p.a.band)}${pg(p.a)}<br>${esc(p.b.title)} — ${esc(p.b.band)}${pg(p.b)}</span>
+           <span class="muted">${esc(p.reason)}</span>
+         </button>`).join('')}
+     </div>
+     <div class="dlg-actions"><button class="btn" value="cancel">Fechar</button></div>`
+  );
+  if (r === null) return;
+  const p = pairs[+r];
+  if (await mergeFlow(p.a, p.b)) await duplicatesDialog(); // volta para a lista, já sem o par juntado
 }
 
 async function addToSetlistDialog(song) {
@@ -912,6 +1070,7 @@ async function menuDialog() {
      <div class="pick">
        <button class="pick-item" value="sync">Sincronizar com o Drive</button>
        <button class="pick-item" value="import-folder">Importar pasta inteira</button>
+       <button class="pick-item" value="dups">Achar músicas repetidas</button>
        <button class="pick-item" value="backup">Exportar backup (.json)</button>
        <button class="pick-item" value="restore">Restaurar backup</button>
        <button class="pick-item danger" value="wipe">Apagar tudo deste aparelho</button>
@@ -921,6 +1080,7 @@ async function menuDialog() {
   );
   if (r === 'sync') runSync();
   if (r === 'import-folder') $('#folderInput').click();
+  if (r === 'dups') await duplicatesDialog();
   if (r === 'restore') $('#backupInput').click();
   if (r === 'backup') { toast('Gerando backup…', 30000); await exportBackup(); toast('Backup gerado'); }
   if (r === 'wipe' && (await confirmBox('Apagar todas as músicas e repertórios deste tablet? Isso não tem volta.', 'Apagar tudo', true))) {

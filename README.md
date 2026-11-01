@@ -20,6 +20,17 @@ Quando houver músicas "Sem banda", aparece um aviso em Músicas > **Completar a
 
 Depois disso, importar `Nome da Música 2.jpg` sem banda adiciona a página à música que já tem banda.
 
+## Arrumar a biblioteca
+
+Músicas > ✎ (editar):
+
+- **⇄ Trocar banda e título** inverte os dois campos (para quando vieram invertidos). Se a versão certa já existir, o app oferece juntar.
+- **Juntar com outra música…** une as páginas de duas músicas numa só. Você escolhe qual nome fica e qual vem primeiro; os repertórios passam a apontar para a música juntada.
+- **Reordenar páginas…** (só em músicas com mais de uma página) sobe e desce cada página.
+- Mudar só as maiúsculas/minúsculas da banda vale para todas as músicas dela. Bandas escritas de jeitos diferentes ("legião urbana", "Legião Urbana") são tratadas como uma só.
+
+Menu `⋮` > **Achar músicas repetidas** lista pares que parecem a mesma música (banda e título trocados, pontuação diferente, uma sem banda) e deixa juntar com um toque.
+
 ## Montar pela lista
 
 Repertórios > **📋 Montar pela lista**: cole a sequência que saiu no grupo, uma música por linha.

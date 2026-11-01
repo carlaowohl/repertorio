@@ -3,6 +3,8 @@
 // pages:    { id: `${songId}#${n}`, songId, n, blob }
 // setlists: { id, name, items: [songId], createdAt, updatedAt }
 
+import { fold } from './names.js';
+
 const DB_NAME = 'repertorio';
 const DB_VERSION = 1;
 let dbPromise;
@@ -48,13 +50,8 @@ async function store(name, mode = 'readonly') {
 export const uid = () =>
   Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 
-export const songKey = (band, title) =>
-  `${band}|${title}`
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[̀-ͯ]/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
+// Mesma banda + mesmo título, sem ligar para maiúsculas, acentos e espaços repetidos.
+export const songKey = (band, title) => fold(`${band}|${title}`);
 
 export async function getAll(name) {
   return promisify((await store(name)).getAll());

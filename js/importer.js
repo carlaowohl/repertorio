@@ -5,10 +5,11 @@
 //   "Nome da Música 1.jpg"              -> sem banda (ou nome da pasta, se veio de pasta)
 //   "Banda/Nome da Música.jpg"          -> banda pela pasta, página 1
 import * as db from './db.js';
+import { NO_BAND, fold, bandNames } from './names.js';
 
 const MAX_SIDE = 2400; // px — legível no tablet e bem mais leve que foto original
 const JPEG_QUALITY = 0.85;
-export const NO_BAND = 'Sem banda';
+export { NO_BAND };
 
 export function parseFileName(file) {
   const base = file.name.replace(/\.[^.]+$/, '').replace(/_/g, ' ').trim();
@@ -16,10 +17,15 @@ export function parseFileName(file) {
 
   let band = '';
   let rest = base;
-  const sep = base.indexOf(' - ');
-  if (sep > 0) {
-    band = base.slice(0, sep).trim();
-    rest = base.slice(sep + 3).trim();
+  // Separador banda/título: " - ", e também "Banda- Título", "Banda -Título" e travessões (– —).
+  // Hífen colado dos dois lados ("Jota-Quest") não separa.
+  const sepMatch = /\s+[-–—]\s*|\s*[-–—]\s+/.exec(base);
+  const afterSep = sepMatch ? base.slice(sepMatch.index + sepMatch[0].length).trim() : '';
+  const bothSides = sepMatch && /^\s/.test(sepMatch[0]) && /\s$/.test(sepMatch[0]);
+  // Com espaço só de um lado, exige letras depois ("Música -2" é página, não banda).
+  if (sepMatch && sepMatch.index > 0 && (bothSides || /[A-Za-zÀ-ÿ]/.test(afterSep))) {
+    band = base.slice(0, sepMatch.index).trim();
+    rest = afterSep;
   } else if (folder) {
     band = folder.trim();
   }
@@ -69,11 +75,16 @@ export async function importFiles(fileList, onProgress = () => {}) {
     const hits = existing.filter((s) => s.band !== NO_BAND && db.songKey('', s.title) === t);
     return hits.length === 1 ? hits[0].band : NO_BAND;
   };
+  // Banda já cadastrada com outra grafia ("legião urbana" x "Legião Urbana") usa a que já existe.
+  const names = bandNames(existing);
 
   for (const file of files) {
     const parsed = parseFileName(file);
     const { title, page } = parsed;
-    const band = parsed.band === NO_BAND ? bandFor(title) : parsed.band;
+    let band = parsed.band === NO_BAND ? bandFor(title) : parsed.band;
+    const known = names.get(fold(band));
+    if (known) band = known;
+    else names.set(fold(band), band);
     const key = db.songKey(band, title);
     let song = touched.get(key) || (await db.findSongByKey(key));
     if (!song) {
